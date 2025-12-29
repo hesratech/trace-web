@@ -1,4 +1,7 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
+const envPath = fileURLToPath(new URL('./.env', import.meta.url));
+dotenv.config({ path: envPath });
+
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
@@ -8,9 +11,9 @@ import fs from 'node:fs';
 import { readdirSync, statSync, existsSync } from 'node:fs';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import crypto from 'crypto';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
 import OpenAI from 'openai';
 import { getTemplate } from './templates/index.js';
 import { analyzeAllImages } from './vision-analysis.js';
@@ -20,6 +23,29 @@ import { createStoryLock } from './story-lock.js';
 import { ProgressReporter, PROGRESS_WEIGHTS, calculateProgress } from './progress-reporter.js';
 import { findAssetsDir, getAvailableMusicFiles } from './music-selector.js';
 import { signVideoPath } from './cloudfront-signer.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const REQUIRED_ENVS = [
+  'AWS_REGION',
+  'S3_BUCKET',
+  'CLOUDFRONT_DOMAIN',
+  'OPENAI_API_KEY',
+  'AWS_ACCESS_KEY_ID',
+  'AWS_SECRET_ACCESS_KEY',
+];
+
+const missing = REQUIRED_ENVS.filter(
+  (k) => !process.env[k] || String(process.env[k]).trim() === ''
+);
+if (missing.length) {
+  console.error('[FATAL] Missing env:', missing.join(', '));
+  process.exit(1);
+}
+console.log('[BOOT] AWS_REGION=', process.env.AWS_REGION);
+console.log('[BOOT] S3_BUCKET=', process.env.S3_BUCKET);
+console.log('[BOOT] CLOUDFRONT_DOMAIN=', process.env.CLOUDFRONT_DOMAIN);
 
 // Promisify exec for ESM-safe usage
 const exec = promisify(execCb);
@@ -51,9 +77,6 @@ if (!openaiApiKey.startsWith('sk-')) {
 // Log environment variable status (only log last 6 characters for verification)
 console.log('[SERVER] OPENAI_API_KEY: loaded (last6: ...' + openaiApiKey.slice(-6) + ')');
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -61,32 +84,46 @@ const PORT = process.env.PORT || 3001;
 const MIN_PHOTOS = 6;
 const MAX_PHOTOS = 36;
 
-// S3 configuration (fixed defaults per requirement)
-const S3_BUCKET = process.env.S3_BUCKET || 'trace-media-uploads';
-const AWS_REGION =
-  process.env.AWS_REGION ||
-  process.env.AWS_DEFAULT_REGION ||
-  'us-east-2';
+// S3 configuration (fail fast if missing bucket)
+const AWS_REGION = process.env.AWS_REGION || 'us-east-2';
+const S3_BUCKET = process.env.S3_BUCKET;
+if (!S3_BUCKET) {
+  console.error('[SERVER] FATAL: S3_BUCKET is missing. Set S3_BUCKET=trace-media-prod in server/.env');
+  process.exit(1);
+}
+const CLOUDFRONT_DOMAIN = process.env.CLOUDFRONT_DOMAIN || '';
+
+console.log('[S3] Using bucket:', S3_BUCKET);
+console.log('[S3] Region:', AWS_REGION);
 
 const s3 = new S3Client({ region: AWS_REGION });
 
 async function uploadFinalVideoToS3(localPath, filename, options = {}) {
   const { signedUrlTtlSeconds = 60 * 60 * 24 } = options; // default 24h
-  const key = `videos/${filename}`;
+  const key = `videos/published/${filename}`;
 
-  console.log("[S3] Uploading...", { bucket: S3_BUCKET, region: AWS_REGION, key });
+  console.log("[S3] Upload start", { bucket: S3_BUCKET, region: AWS_REGION, key, localPath });
 
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: S3_BUCKET,
-      Key: key,
-      Body: fs.createReadStream(localPath),
-      ContentType: "video/mp4",
-      CacheControl: "public, max-age=31536000",
-    })
-  );
+  try {
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: key,
+        Body: fs.createReadStream(localPath),
+        ContentType: "video/mp4",
+        CacheControl: "public, max-age=31536000",
+      })
+    );
+  } catch (err) {
+    const code = err?.name || err?.Code || 'UnknownError';
+    const message = err?.message || 'Upload failed';
+    console.error("[S3] Upload error", { code, message });
+    throw err;
+  }
 
   const s3Url = `https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+  const resourcePath = `/${key}`;
+  const cdnUrl = CLOUDFRONT_DOMAIN ? `https://${CLOUDFRONT_DOMAIN}/${key}` : null;
 
   let signedUrl = null;
   try {
@@ -99,9 +136,9 @@ async function uploadFinalVideoToS3(localPath, filename, options = {}) {
     console.warn("[S3] Failed to create presigned URL, using public URL", err?.message);
   }
 
-  console.log("[S3] Uploaded final video ->", { bucket: S3_BUCKET, region: AWS_REGION, key });
+  console.log("[S3] Upload success", { key });
 
-  return { key, s3Url, signedUrl };
+  return { key, s3Url, signedUrl, resourcePath, cdnUrl };
 }
 
 /**
@@ -1389,6 +1426,7 @@ async function renderFromPlan(plan, photoPathsMap, outputPath, memoryId, photos,
   
   // Resolve music track path (optional; fallback to no audio if not found)
   const musicPath = resolveMusicPath(plan.storyPlan, { jobId: requestId });
+  console.log('[MUSIC] selected', { musicPath: musicPath || null });
   
   // CRITICAL: Verify order is NOT sequential (proves AI reordered)
   const isSequential = plan.order.every((val, idx) => val === idx);
@@ -1651,7 +1689,7 @@ async function renderFromPlan(plan, photoPathsMap, outputPath, memoryId, photos,
   }
   
   await renderWithXfade(ffmpegPath, segments, segmentDurations, transitions, outputPath, fps, outputWidth, outputHeight, musicPath, movementMode);
-  console.log(`[VIDEO] Final video assembled: ${outputPath}`);
+  console.log('[FFMPEG] completed', { outputPath });
   
   if (progressReporter) {
     progressReporter.report('encoding', PROGRESS_WEIGHTS.FFMPEG_ENCODE.end, 'Encoding complete');
@@ -2375,6 +2413,7 @@ app.post('/api/create-memory', async (req, res) => {
     }
     
     console.log('[CREATE-MEMORY] Starting memory creation');
+    console.log('[RENDER] start', { sessionId });
     console.log(`[CREATE-MEMORY] Request body keys:`, Object.keys(req.body));
     console.log(`[CREATE-MEMORY] SSE requested: ${wantsSSE}`);
     
@@ -2937,10 +2976,10 @@ app.post('/api/create-memory', async (req, res) => {
     });
 
     // Upload final MP4 to S3
-    const { s3Url, key: s3Key, signedUrl: s3SignedUrl } =
+    const { s3Url, key: s3Key, signedUrl: s3SignedUrl, resourcePath, cdnUrl } =
       await uploadFinalVideoToS3(outputPath, videoFilename);
-    const videoUrl = s3SignedUrl || s3Url;
-    console.log("[S3] uploaded", { s3Key, s3Url, s3SignedUrl });
+    const videoUrl = s3SignedUrl || cdnUrl || s3Url;
+    console.log("[S3] uploaded", { s3Key, s3Url, s3SignedUrl, cdnUrl, resourcePath });
     console.log(`[CREATE-MEMORY] Final video uploaded to S3: ${s3Key}`);
     
     // Store render info for debug endpoint
@@ -2989,11 +3028,12 @@ app.post('/api/create-memory', async (req, res) => {
     const responseData = {
       success: true,
       memoryId: sessionId,
-      videoUrl,  // Prefer signed URL for playback; falls back to S3 URL
+      videoUrl,  // Prefer signed URL for playback; falls back to CDN then S3 URL
       s3Key: s3Key,
       s3Url: s3Url,
       s3SignedUrl: s3SignedUrl,
-      localPath: outputPath,
+      resourcePath,
+      cdnUrl,
       memoryNote: safePlanForResponse.memoryNote,
       usedPlanner: safePlanForResponse.usedPlanner,
       beats: beats,
@@ -3004,6 +3044,7 @@ app.post('/api/create-memory', async (req, res) => {
     console.log(`[CREATE-MEMORY]   usedPlanner: ${responseData.usedPlanner}`);
     console.log(`[CREATE-MEMORY]   videoUrl: ${responseData.videoUrl}`);
     console.log(`[CREATE-MEMORY]   memoryNote: ${responseData.memoryNote}`);
+    console.log('[RESPONSE] sent', { memoryId: sessionId, videoUrl: responseData.videoUrl, s3Key: responseData.s3Key });
     
     // If SSE, send completion event; otherwise send JSON response
     if (progressReporter) {

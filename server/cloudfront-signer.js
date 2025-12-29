@@ -38,3 +38,6 @@ export function signVideoPath(resourcePath, options = {}) {
   return { signedUrl, expiresInSeconds: ttl, url };
 }
 
+
+
+
