@@ -1,6 +1,11 @@
 ﻿FROM node:18-bullseye
 
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+# Make apt more reliable in CI/build environments
+RUN set -eux; \
+  echo 'Acquire::Retries "5"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' > /etc/apt/apt.conf.d/80-retries; \
+  apt-get update; \
+  apt-get install -y --no-install-recommends ffmpeg ca-certificates; \
+  rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
