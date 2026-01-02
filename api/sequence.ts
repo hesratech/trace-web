@@ -155,7 +155,8 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     // Get model (support OPENAI_SEQUENCE_MODEL or fallback to OPENAI_MODEL or default)
-    const modelName = process.env.OPENAI_SEQUENCE_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+    // Responses API compatible models: gpt-4.1-mini, gpt-4.1
+    const modelName = process.env.OPENAI_SEQUENCE_MODEL || process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 
     // Initialize OpenAI client
     const openai = new OpenAI({ apiKey });
@@ -189,11 +190,8 @@ export default async function handler(req: Request): Promise<Response> {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 30000); // 30s timeout
       
-      const response = await openai.chat.completions.create({
-        model: modelName,
-        messages: [{
-          role: 'system',
-          content: `You are a professional video editor creating a cinematic memory video sequence plan.
+      // Build the prompt for Responses API
+      const systemPrompt = `You are a professional video editor creating a cinematic memory video sequence plan.
 
 Your task is to order ALL provided images into a story (no omissions).
 
@@ -214,24 +212,37 @@ HARD CONSTRAINTS:
 4) Avoid near-duplicate adjacency (similar tags/composition).
 5) Do NOT preserve upload order unless it is already the absolute best story.
 
-Return valid JSON only, no markdown, no code fences.`
-        }, {
-          role: 'user',
-          content: `Order ALL images for a story (do NOT drop any).
+Return valid JSON only, no markdown, no code fences.`;
+
+      const userPrompt = `Order ALL images for a story (do NOT drop any).
 User prompt: ${promptText || '(none)'}
 images = ${JSON.stringify(compact)}
 
-Return orderedIds containing every id exactly once (length == images.length) and beats with roles (opening/build/turn/climax/resolution).`
-        }],
-        temperature: 0.4,
-        max_tokens: 1200
+Return orderedIds containing every id exactly once (length == images.length) and beats with roles (opening/build/turn/climax/resolution).`;
+
+      // Use Responses API
+      const response = await (openai as any).responses.create({
+        model: modelName,
+        input: [
+          {
+            role: 'system',
+            content: [{ type: 'input_text', text: systemPrompt }]
+          },
+          {
+            role: 'user',
+            content: [{ type: 'input_text', text: userPrompt }]
+          }
+        ],
+        max_output_tokens: 1200,
+        temperature: 0.4
       }, {
         signal: controller.signal
       });
       
       clearTimeout(timeout);
       
-      const content = response.choices[0].message.content?.trim() || '';
+      // Responses API returns output_text instead of choices[0].message.content
+      const content = (response.output_text || response.output || '').trim();
       
       // Safe JSON parsing with fallback
       const fallbackPlan = {

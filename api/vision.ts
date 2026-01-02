@@ -1,6 +1,6 @@
 /**
  * Vercel Serverless Function: Vision Analysis
- * Analyzes images using OpenAI Vision API
+ * Analyzes images using OpenAI Responses API
  * 
  * POST /api/vision
  * Body: { photos: Array<{filename: string, data: string (base64), mimeType?: string}> }
@@ -69,7 +69,7 @@ function createFallbackAnalysis(filename: string): any {
 }
 
 /**
- * Analyze a single image using OpenAI Vision API
+ * Analyze a single image using OpenAI Responses API
  */
 async function analyzeImage(
   imageBase64: string,
@@ -82,13 +82,10 @@ async function analyzeImage(
   const timeout = setTimeout(() => controller.abort(), 30000); // 30s timeout per image
   
   try {
-    const response = await openai.chat.completions.create({
-      model: modelName,
-      messages: [{
-        role: 'system',
-        content: `You are a professional cinematographer and video editor analyzing images for a cinematic memory video.
+    // Build the prompt with image reference
+    const prompt = `You are a professional cinematographer and video editor analyzing images for a cinematic memory video.
 
-Your task is to analyze each image and output structured JSON with:
+Your task is to analyze the provided image and output structured JSON with:
 - subject: what the image is "about" (architecture/person/object/landscape/abstract)
 - composition: framing (wide/medium/close), symmetry (high/medium/low), leading_lines (yes/no), negative_space (high/medium/low)
 - light: key (high-key/low-key/mid-key), contrast (high/medium/low), directionality (front/side/back/ambient)
@@ -107,23 +104,27 @@ CRITICAL RULES:
 - If composition has high symmetry, prefer straight push/pull (no sideways drift).
 - If no depth exists, do not suggest parallax moves.
 
-Output ONLY valid JSON, no markdown, no code fences.`
-      }, {
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: 'Analyze this image and output the structured JSON as specified. Output only JSON, no markdown.'
-          },
-          {
-            type: 'image_url',
-            image_url: {
-              url: `data:${mimeType};base64,${imageBase64}`
+Output ONLY valid JSON, no markdown, no code fences. Analyze the image and provide the structured JSON.`;
+
+    // Note: Responses API structure - using input with image data URL
+    const response = await (openai as any).responses.create({
+      model: modelName,
+      input: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'input_text',
+              text: prompt
+            },
+            {
+              type: 'input_image',
+              image_url: `data:${mimeType};base64,${imageBase64}`
             }
-          }
-        ]
-      }],
-      max_tokens: 800,
+          ]
+        }
+      ],
+      max_output_tokens: 800,
       temperature: 0.3
     }, {
       signal: controller.signal
@@ -131,7 +132,8 @@ Output ONLY valid JSON, no markdown, no code fences.`
     
     clearTimeout(timeout);
     
-    const content = response.choices[0].message.content?.trim() || '';
+    // Responses API returns output_text instead of choices[0].message.content
+    const content = (response.output_text || response.output || '').trim();
     
     // Safe JSON parsing with fallback
     const analysis = safeParseJSON(content, createFallbackAnalysis(filename));
@@ -222,7 +224,8 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     // Get model (support OPENAI_VISION_MODEL or fallback to OPENAI_MODEL or default)
-    const modelName = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+    // Responses API compatible models: gpt-4.1-mini, gpt-4.1
+    const modelName = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 
     // Initialize OpenAI client
     const openai = new OpenAI({ apiKey });
